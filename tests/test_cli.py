@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import os
 import runpy
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
-from lsmkv.cli import MAX_DISPLAY_BYTES, MAX_ENTRIES, format_bytes, main
+from lsmkv.cli import MAX_DISPLAY_BYTES, MAX_ENTRIES, format_bytes, format_path, main
 from lsmkv.sstable import write_sstable
 from lsmkv.types import Entry
 
@@ -140,6 +147,111 @@ def test_missing_file_exits_2_without_traceback(
 def test_directory_exits_2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["verify", str(tmp_path)]) == 2
     assert "Traceback" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("raw", "shown"),
+    [
+        ("plain/dir/table.sst", "plain/dir/table.sst"),
+        ("", ""),
+        ("a\nb", "a\\nb"),
+        ("a\x1b[31mred", "a\\x1b[31mred"),
+        ("café", "caf\\xe9"),
+        ("snow☃", "snow\\u2603"),
+        ("bad\udcff", "bad\\udcff"),
+        ("del\x7f", "del\\x7f"),
+        ("nul\x00", "nul\\x00"),
+    ],
+)
+def test_format_path_escapes_unsafe_characters(raw: str, shown: str) -> None:
+    assert format_path(raw) == shown
+
+
+@given(st.text())
+def test_format_path_is_always_printable_ascii(raw: str) -> None:
+    shown = format_path(raw)
+    assert all(0x20 <= ord(c) <= 0x7E for c in shown)
+
+
+@pytest.mark.parametrize("command", ["inspect", "verify"])
+def test_odd_paths_are_reported_safely(command: str, capsys: pytest.CaptureFixture[str]) -> None:
+    for odd in ("no\nsuch\x1b[2Jfile\udcff.sst", "nul\x00byte.sst"):
+        assert main([command, odd]) == 2
+        err = capsys.readouterr().err
+        assert err.startswith("lsmkv: cannot read ")
+        assert err.count("\n") == 1
+        assert "\x1b" not in err
+        assert err.isascii()
+
+
+def test_inspect_prints_the_path_safely(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = tmp_path / "café\ttable.sst"
+    write_sstable(path, ENTRIES)
+    assert main(["inspect", str(path)]) == 0
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first.endswith("caf\\xe9\\ttable.sst")
+    assert first.isascii()
+
+
+class _ClosedPipe:
+    """A stdout whose reader has gone away, backed by a real descriptor."""
+
+    def __init__(self) -> None:
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        self.fd = write_end
+        self.stream = os.fdopen(write_end, "w", closefd=False)
+
+    def close(self) -> None:
+        with contextlib.suppress(OSError):
+            self.stream.close()
+        os.close(self.fd)
+
+
+def test_broken_pipe_exits_quietly_and_redirects_stdout(
+    sst: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pipe = _ClosedPipe()
+    try:
+        monkeypatch.setattr(sys, "stdout", pipe.stream)
+        assert main(["inspect", str(sst)]) == 0
+        monkeypatch.undo()
+        assert capsys.readouterr().err == ""
+        # the descriptor now leads to the null device, so a later flush is silent
+        assert os.stat(pipe.fd).st_rdev == os.stat(os.devnull).st_rdev
+        pipe.stream.flush()
+    finally:
+        pipe.close()
+
+
+def test_broken_pipe_during_print_is_not_an_error(
+    sst: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def explode(*args: object, **kwargs: object) -> None:
+        raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+    monkeypatch.setattr("builtins.print", explode)
+    assert main(["verify", str(sst)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_broken_pipe_in_a_real_process_leaves_no_message(sst: Path) -> None:
+    script = (
+        "import os, sys\n"
+        "from lsmkv.cli import main\n"
+        "r, w = os.pipe()\n"
+        "os.close(r)\n"
+        "os.dup2(w, 1)\n"
+        "sys.exit(main(['inspect', sys.argv[1]]))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(sst)],
+        check=False,
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == b""
 
 
 def test_usage_errors(capsys: pytest.CaptureFixture[str]) -> None:

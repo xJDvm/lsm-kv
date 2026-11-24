@@ -1,6 +1,7 @@
 """Command-line tools for inspecting lsm-kv files.
 
-Exit codes: ``0`` success, ``1`` the file is corrupt, ``2`` usage error or the
+Exit codes: ``0`` success (also when the output pipe is closed early, as in
+``lsmkv inspect f | head``), ``1`` the file is corrupt, ``2`` usage error or the
 file cannot be opened (missing, unreadable, a directory, ...).
 """
 
@@ -8,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import os
 import sys
 from collections.abc import Sequence
 
@@ -43,6 +45,35 @@ def format_bytes(data: bytes, limit: int = MAX_DISPLAY_BYTES) -> str:
     return text
 
 
+def format_path(path: str) -> str:
+    """Render a file path for humans without raising or emitting control characters.
+
+    Printable ASCII is kept as-is; every other character (control characters,
+    non-ASCII text and the surrogates Python uses for undecodable bytes) is
+    shown as a backslash escape such as ``\\n``, ``\\xe9`` or ``\\udcff``.
+    """
+    return "".join(c if 0x20 <= ord(c) <= 0x7E else ascii(c)[1:-1] for c in path)
+
+
+def _silence_stdout() -> None:
+    """Point the stdout file descriptor at the null device.
+
+    After a broken pipe the buffered output can never be delivered, and the
+    interpreter would report a second error when it flushes stdout at exit.
+    Redirecting the descriptor, as the Python documentation recommends, lets
+    that final flush succeed silently.
+    """
+    try:
+        fd = sys.stdout.fileno()
+    except (OSError, ValueError):  # no real descriptor behind sys.stdout
+        return
+    null = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(null, fd)
+    finally:
+        os.close(null)
+
+
 def _entries_arg(raw: str) -> int:
     try:
         n = int(raw)
@@ -75,7 +106,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _inspect(path: str, entries: int) -> None:
     with SSTableReader(path) as reader:
         min_key, max_key = reader.min_key, reader.max_key
-        print(f"file: {path}")
+        print(f"file: {format_path(path)}")
         print(f"entries: {len(reader)}")
         print(f"blocks: {reader.num_blocks}")
         print(f"min key: {'-' if min_key is None else format_bytes(min_key)}")
@@ -100,10 +131,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             _inspect(args.file, args.entries)
         else:
             _verify(args.file)
+        sys.stdout.flush()  # surface a closed pipe here, not at interpreter exit
+    except BrokenPipeError:
+        # The reader went away (``lsmkv inspect f | head``); that is not an error.
+        _silence_stdout()
+        return _EXIT_OK
     except CorruptionError as exc:
         print(f"corrupt sstable: {exc}", file=sys.stderr)
         return _EXIT_CORRUPT
-    except OSError as exc:
-        print(f"lsmkv: cannot read {args.file}: {exc.strerror or exc}", file=sys.stderr)
+    except (OSError, ValueError) as exc:  # ValueError: NUL byte in the path
+        reason = getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
+        print(f"lsmkv: cannot read {format_path(args.file)}: {reason}", file=sys.stderr)
         return _EXIT_USAGE
     return _EXIT_OK
