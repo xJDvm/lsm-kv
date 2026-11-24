@@ -17,6 +17,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Final
 
+from lsmkv.compaction import pick_tiered_run
 from lsmkv.errors import ClosedError, CorruptionError
 from lsmkv.manifest import Manifest, fsync_dir, table_path
 from lsmkv.memtable import Memtable
@@ -57,6 +58,7 @@ class DB:
         *,
         memtable_bytes: int,
         block_size: int,
+        compaction_trigger: int,
         manifest: Manifest,
         readers: list[SSTableReader],
         memtable: Memtable,
@@ -65,6 +67,7 @@ class DB:
         self._path = path
         self._memtable_bytes = memtable_bytes
         self._block_size = block_size
+        self._compaction_trigger = compaction_trigger
         self._manifest = manifest
         self._readers = readers  # parallel to manifest.tables, newest first
         self._memtable = memtable
@@ -80,6 +83,7 @@ class DB:
         memtable_bytes: int = 4 * 1024 * 1024,
         sync: bool = False,
         block_size: int = 4096,
+        compaction_trigger: int = 4,
     ) -> DB:
         """Open the database in directory ``path``, creating it if needed.
 
@@ -92,6 +96,8 @@ class DB:
             memtable_bytes: Approximate memtable size that triggers a flush.
             sync: If true, fsync the log on every write.
             block_size: Target data block size for new SSTables.
+            compaction_trigger: Minimum number of similarly sized, adjacent
+                tables that triggers an automatic compaction after a flush.
 
         Raises:
             ValueError: an option is out of range.
@@ -103,6 +109,8 @@ class DB:
             raise ValueError("memtable_bytes must be >= 1")
         if block_size < 1:
             raise ValueError("block_size must be >= 1")
+        if compaction_trigger < 2:
+            raise ValueError("compaction_trigger must be >= 2")
         directory = Path(path)
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -124,6 +132,7 @@ class DB:
                 directory,
                 memtable_bytes=memtable_bytes,
                 block_size=block_size,
+                compaction_trigger=compaction_trigger,
                 manifest=manifest,
                 readers=readers,
                 memtable=memtable,
@@ -252,6 +261,25 @@ class DB:
             self._check_open()
             self._flush_locked()
 
+    def compact(self) -> None:
+        """Merge every SSTable into one (a manual major compaction).
+
+        Shadowed values and all tombstones are discarded, since the output
+        includes the oldest table. With no tables this does nothing; with a
+        single table it is still rewritten so its tombstones are reclaimed. If
+        every entry turns out to be a tombstone no table is written at all.
+        The memtable is not touched; call :meth:`flush` first to include it.
+
+        Raises:
+            ClosedError: the database is closed.
+            CorruptionError: a table is damaged.
+            OSError: the merged table could not be written or published.
+        """
+        with self._lock:
+            self._check_open()
+            if self._readers:
+                self._compact_locked(range(len(self._readers)))
+
     def close(self) -> None:
         """Close the log and every table. Closing twice is a no-op.
 
@@ -327,6 +355,87 @@ class DB:
             # The published state may differ from memory; stop using it.
             self._shutdown()
             raise
+        self._auto_compact_locked()
+
+    def _auto_compact_locked(self) -> None:
+        """Compact similarly sized adjacent tables until none qualify.
+
+        Every pass shrinks the table list by at least one, so the loop is
+        bounded by the current table count. A failure propagates to the caller
+        of the flush that triggered it; the flushed data is already durable.
+        """
+        for _ in range(len(self._readers)):
+            sizes = [table_path(self._path, i).stat().st_size for i in self._manifest.tables]
+            run = pick_tiered_run(sizes, min_tables=self._compaction_trigger)
+            if run is None:
+                return
+            self._compact_locked(run)
+
+    def _compact_locked(self, run: range) -> None:
+        """Merge the tables at manifest positions ``run`` into one table.
+
+        The caller holds the lock, has checked the database is open and passes
+        a non-empty, in-bounds, contiguous ``run`` (positions are newest first).
+        The merged table takes the run's place, so the recency order of every
+        other table is unchanged. Tombstones are dropped only if the run
+        includes the oldest table: otherwise an older table outside the run may
+        hold a value the tombstone still has to shadow (invariant 3). Recency is
+        defined by manifest order, not by id, so the new table simply gets the
+        next unused id.
+
+        Crash analysis. The steps are:
+
+        1. merge into ``<id>.sst.tmp`` and fsync it;
+        2. rename it to ``<id>.sst`` and fsync the directory;
+        3. commit a manifest with the run replaced by ``<id>``;
+        4. close the old readers and unlink the old files.
+
+        A crash before step 3 completes leaves the old manifest in force and
+        every old table intact; the new file is an orphan deleted on the next
+        open. A crash after step 3 leaves the new manifest in force and the old
+        files are orphans, also deleted on open. Both states hold the same
+        logical data. If the merged output is empty (only tombstones at the
+        bottom) nothing is written and the manifest simply omits the run.
+
+        A failure while reading or writing the temporary file leaves everything
+        unchanged and the database usable. A failure after the rename follows
+        the flush policy: the database shuts itself down and reopening
+        recovers.
+        """
+        old_ids = self._manifest.tables[run.start : run.stop]
+        old_readers = self._readers[run.start : run.stop]
+        bottom = run.stop == len(self._readers)
+        merged = merge_iterators([reader.items() for reader in old_readers])
+        table_id = self._manifest.next_id
+        final = table_path(self._path, table_id)
+        tmp = final.with_name(final.name + ".tmp")
+        count = write_sstable(
+            tmp, drop_tombstones(merged) if bottom else merged, block_size=self._block_size
+        )
+        try:
+            if count > 0:
+                os.replace(tmp, final)
+                fsync_dir(self._path)
+                replacement: tuple[int, ...] = (table_id,)
+            else:
+                tmp.unlink()
+                replacement = ()
+            tables = (*self._manifest.tables[: run.start], *replacement)
+            manifest = Manifest(
+                table_id + len(replacement), (*tables, *self._manifest.tables[run.stop :])
+            )
+            Manifest.commit(self._path, manifest)
+            self._manifest = manifest
+            new_readers = [SSTableReader(final)] if count > 0 else []
+            self._readers[run.start : run.stop] = new_readers
+        except BaseException:
+            self._shutdown()
+            raise
+        for reader in old_readers:
+            reader.close()
+        for old_id in old_ids:
+            with contextlib.suppress(FileNotFoundError):
+                table_path(self._path, old_id).unlink()
 
     def _shutdown(self) -> None:
         if self._closed:

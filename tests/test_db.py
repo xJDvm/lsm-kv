@@ -108,7 +108,7 @@ def test_flush_of_empty_memtable_is_a_noop(tmp_path: Path) -> None:
 
 def test_small_memtable_forces_several_flushes(tmp_path: Path) -> None:
     expected = dict(kv(i) for i in range(300))
-    with DB.open(tmp_path, memtable_bytes=1024, block_size=256) as db:
+    with DB.open(tmp_path, memtable_bytes=1024, block_size=256, compaction_trigger=10**6) as db:
         for key, value in expected.items():
             db.put(key, value)
         assert len(db.table_ids) > 3
