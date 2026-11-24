@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 from types import TracebackType
 from typing import Final
@@ -19,6 +20,7 @@ from typing import Final
 from lsmkv.errors import ClosedError, CorruptionError
 from lsmkv.manifest import Manifest, fsync_dir, table_path
 from lsmkv.memtable import Memtable
+from lsmkv.merge import drop_tombstones, merge_iterators
 from lsmkv.sstable import SSTableReader, write_sstable
 from lsmkv.types import MISSING, validate_key, validate_value
 from lsmkv.wal import WAL, recover_wal
@@ -203,6 +205,41 @@ class DB:
                 if found is not MISSING:
                     return found
             return None
+
+    def scan(
+        self, start: bytes | None = None, end: bytes | None = None
+    ) -> Iterator[tuple[bytes, bytes]]:
+        """Return the live entries with ``start <= key < end`` in key order.
+
+        A ``None`` bound leaves that side open. The newest version of each key
+        wins and deleted keys are omitted. If ``start >= end`` the result is
+        empty.
+
+        The result is a consistent snapshot: it is materialized while the lock
+        is held, so later writes, flushes and compactions (which close and
+        delete tables) cannot affect or invalidate an iteration in progress.
+        The trade-off is O(result) memory, so bound the range when scanning a
+        large database.
+
+        Raises:
+            ClosedError: the database is closed.
+            TypeError: a bound is not ``bytes``.
+            ValueError: a bound is empty or too long.
+            CorruptionError: a table needed for the scan is damaged.
+        """
+        with self._lock:
+            self._check_open()
+            if start is not None:
+                validate_key(start)
+            if end is not None:
+                validate_key(end)
+            if start is not None and end is not None and start >= end:
+                return iter(())
+            sources = [
+                self._memtable.items(start, end),
+                *(reader.items(start, end) for reader in self._readers),
+            ]
+            return iter(list(drop_tombstones(merge_iterators(sources))))
 
     def flush(self) -> None:
         """Write the memtable to a new SSTable. Does nothing if it is empty.
