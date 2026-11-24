@@ -1,0 +1,30 @@
+# Python bytecode and packaging
+__pycache__/
+*.py[cod]
+dist/
+build/
+*.egg-info/
+
+# Virtual environments (managed by uv)
+.venv/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Coverage reports
+.coverage
+htmlcov/
+
+# Local secrets and environment files
+.env
+
+# Benchmark scratch data
+bench-data/
+
+# macOS
+.DS_Store
+
+# Note: uv.lock is intentionally NOT ignored, so builds are reproducible.
