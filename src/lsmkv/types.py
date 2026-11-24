@@ -1,6 +1,21 @@
 """Shared types, size limits and input validation."""
 
-from typing import TypeAlias
+import enum
+from typing import Final, TypeAlias
+
+
+class Missing(enum.Enum):
+    """Type of the :data:`MISSING` sentinel."""
+
+    MISSING = enum.auto()
+
+
+MISSING: Final = Missing.MISSING
+"""Lookup result for a key that is not present at all.
+
+It is distinct from ``None``, which means the key is present as a tombstone
+(a deletion that must shadow older data).
+"""
 
 Entry: TypeAlias = tuple[bytes, bytes | None]
 """A key and its value; a value of ``None`` marks a deletion (tombstone)."""
