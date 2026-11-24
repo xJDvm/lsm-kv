@@ -1,6 +1,8 @@
 """Tests for the SSTable writer and reader."""
 
+import struct
 import tempfile
+import zlib
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -8,7 +10,8 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from lsmkv.errors import ClosedError
+from lsmkv.bloom import BloomFilter
+from lsmkv.errors import ClosedError, CorruptionError
 from lsmkv.sstable import SSTableReader, write_sstable
 from lsmkv.types import MISSING, Entry
 
@@ -146,6 +149,76 @@ def test_invalid_keys_raise_value_error(path: Path, entries: list[Entry]) -> Non
     with pytest.raises(ValueError):
         write_sstable(path, entries)
     assert not path.exists()
+
+
+def test_write_to_directory_keeps_it_and_raises_original_error(tmp_path: Path) -> None:
+    target = tmp_path / "dir.sst"
+    target.mkdir()
+    with pytest.raises((IsADirectoryError, PermissionError)):
+        write_sstable(target, [(b"a", b"1")])
+    assert target.is_dir()
+
+
+def test_mid_stream_failure_removes_partial_file(path: Path) -> None:
+    def gen() -> Iterator[Entry]:
+        yield b"b", b"1"
+        yield b"a", b"2"
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        write_sstable(path, gen(), block_size=1)
+    assert not path.exists()
+
+
+def _forged_table(path: Path, blocks: list[list[bytes]]) -> None:
+    """Write a table with valid CRCs whose blocks may overlap in key range."""
+
+    def crc(b: bytes) -> bytes:
+        return struct.pack("<I", zlib.crc32(b) & 0xFFFFFFFF)
+
+    data = bytearray()
+    index = bytearray()
+    all_keys: list[bytes] = []
+    for keys in blocks:
+        body = b"".join(struct.pack("<BII", 1, len(k), 1) + k + b"v" for k in keys)
+        block = body + crc(body)
+        index += struct.pack("<I", len(keys[-1])) + keys[-1]
+        index += struct.pack("<QI", len(data), len(block))
+        data += block
+        all_keys += keys
+    index += crc(bytes(index))
+    bloom = BloomFilter.for_capacity(len(all_keys), 0.01)
+    for k in all_keys:
+        bloom.add(k)
+    bloom_body = bloom.to_bytes()
+    bloom_block = bloom_body + crc(bloom_body)
+    footer = struct.pack(
+        "<QIQIQ8s",
+        len(data),
+        len(index),
+        len(data) + len(index),
+        len(bloom_block),
+        len(all_keys),
+        b"LSMKVT01",
+    )
+    path.write_bytes(bytes(data + index) + bloom_block + footer + crc(footer) + b"\x00" * 4)
+
+
+def test_forged_cross_block_ordering_is_rejected(path: Path) -> None:
+    # Block 1 starts with b"a", which is <= block 0's last key b"b".
+    _forged_table(path, [[b"b"], [b"a", b"c"]])
+    with SSTableReader(path) as r:
+        assert r.get(b"b") == b"v"
+        with pytest.raises(CorruptionError):
+            r.get(b"c")
+        with pytest.raises(CorruptionError):
+            list(r.items())
+
+
+def test_forged_table_without_overlap_is_accepted(path: Path) -> None:
+    _forged_table(path, [[b"a", b"b"], [b"c"]])
+    with SSTableReader(path) as r:
+        assert [k for k, _ in r.items()] == [b"a", b"b", b"c"]
+        assert r.get(b"c") == b"v"
 
 
 def test_invalid_types_and_parameters(path: Path) -> None:

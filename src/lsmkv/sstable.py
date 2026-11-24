@@ -93,13 +93,16 @@ def write_sstable(
         raise ValueError("block_size must be >= 1")
     if not 0.0 < fp_rate < 1.0:
         raise ValueError("fp_rate must be in (0, 1)")
+    # Opened outside the try so that a failure to open (for example a directory
+    # at ``path``) never deletes something this call did not create.
+    f = open(path, "wb")  # noqa: SIM115
     try:
-        with open(path, "wb") as f:
+        with f:
             count = _write_stream(f, entries, block_size, fp_rate)
             f.flush()
             os.fsync(f.fileno())
     except BaseException:
-        with contextlib.suppress(FileNotFoundError):
+        with contextlib.suppress(OSError):
             os.unlink(path)
         raise
     return count
@@ -155,8 +158,12 @@ def _write_stream(f: BinaryIO, entries: Iterable[Entry], block_size: int, fp_rat
     return len(keys)
 
 
-def _parse_block(data: bytes, last_key: bytes) -> list[Entry]:
-    """Validate one data block (including its CRC) and decode its entries."""
+def _parse_block(data: bytes, last_key: bytes, lower_bound: bytes | None) -> list[Entry]:
+    """Validate one data block (including its CRC) and decode its entries.
+
+    ``lower_bound`` is the exclusive lower bound for the block's keys (the
+    previous block's last key), or ``None`` for the first block.
+    """
     if len(data) < _MIN_BLOCK_SIZE:
         raise CorruptionError("data block too short")
     body_len = len(data) - _CRC_SIZE
@@ -164,7 +171,7 @@ def _parse_block(data: bytes, last_key: bytes) -> list[Entry]:
         raise CorruptionError("data block checksum mismatch")
     entries: list[Entry] = []
     pos = 0
-    prev: bytes | None = None
+    prev: bytes | None = lower_bound
     while pos < body_len:
         if body_len - pos < _ENTRY_HEADER.size:
             raise CorruptionError("truncated entry header")
@@ -181,7 +188,7 @@ def _parse_block(data: bytes, last_key: bytes) -> list[Entry]:
         key = data[pos : pos + klen]
         pos += klen
         if prev is not None and key <= prev:
-            raise CorruptionError("keys not strictly increasing within block")
+            raise CorruptionError("keys not strictly increasing")
         prev = key
         value = None if kind == _KIND_TOMBSTONE else data[pos : pos + vlen]
         pos += vlen
@@ -197,6 +204,10 @@ class SSTableReader:
     Opening validates the footer, index and Bloom filter eagerly; data blocks
     are read, checksummed and validated lazily, one at a time. The reader holds
     the file open until :meth:`close` (or the end of a ``with`` block).
+
+    Not safe for concurrent use from multiple threads (shared file position).
+    CRCs guard against accidental corruption, not forgery: the footer entry
+    count is only range-checked, not verified against the data blocks.
 
     Raises:
         CorruptionError: (from the constructor and all reads) the file is
@@ -309,7 +320,8 @@ class SSTableReader:
     def _read_block(self, i: int) -> list[Entry]:
         self._check_open()
         data = self._read_at(self._offsets[i], self._lengths[i])
-        return _parse_block(data, self._last_keys[i])
+        lower = self._last_keys[i - 1] if i > 0 else None
+        return _parse_block(data, self._last_keys[i], lower)
 
     def __len__(self) -> int:
         """Number of entries (values and tombstones) recorded in the footer."""
@@ -365,12 +377,8 @@ class SSTableReader:
 
     def _iter_range(self, start: bytes | None, end: bytes | None) -> Iterator[Entry]:
         first = 0 if start is None else bisect.bisect_left(self._last_keys, start)
-        prev: bytes | None = None
         for i in range(first, len(self._offsets)):
             for key, value in self._read_block(i):
-                if prev is not None and key <= prev:
-                    raise CorruptionError("keys not strictly increasing across blocks")
-                prev = key
                 if start is not None and key < start:
                     continue
                 if end is not None and key >= end:
