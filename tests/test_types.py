@@ -64,6 +64,17 @@ def test_value_wrong_type_rejected(bad: object) -> None:
         validate_value(bad)
 
 
+class _BytesSubclass(bytes):
+    pass
+
+
+def test_bytes_subclass_rejected() -> None:
+    with pytest.raises(TypeError, match="bytes"):
+        validate_key(_BytesSubclass(b"k"))
+    with pytest.raises(TypeError, match="bytes"):
+        validate_value(_BytesSubclass(b"v"))
+
+
 @given(st.binary(min_size=1, max_size=256))
 def test_key_roundtrip(key: bytes) -> None:
     assert validate_key(key) == key

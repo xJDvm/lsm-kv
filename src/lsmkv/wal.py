@@ -20,6 +20,7 @@ deliberate tampering.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import struct
 import zlib
@@ -50,39 +51,68 @@ class WAL:
     """An append-only write-ahead log.
 
     Use :meth:`open` to create an instance. Not safe for concurrent use.
+
+    The log fails closed: if writing, flushing or syncing raises
+    :class:`OSError`, the file may hold a partial record, so the log is closed
+    and every later operation raises :class:`~lsmkv.errors.ClosedError`. The
+    caller must reopen the log with :meth:`open`, which repairs the partial
+    record.
     """
 
     def __init__(self, file: BinaryIO, *, sync: bool) -> None:
         self._file: BinaryIO | None = file
         self._sync = sync
+        self._failed = False
 
     @classmethod
     def open(cls, path: str | os.PathLike[str], *, sync: bool = False) -> WAL:
         """Open (creating if needed) the log at ``path`` for appending.
 
+        An existing log is first scanned and any torn or corrupt tail is
+        truncated (see :func:`recover_wal`), so that new records follow the
+        last intact one and stay visible to replay.
+
         Args:
             path: Location of the log file.
             sync: If true, ``fsync`` after every append.
         """
+        recover_wal(path)
         return cls(open(path, "ab"), sync=sync)
 
     def _live(self) -> BinaryIO:
         if self._file is None:
-            raise ClosedError("WAL is closed")
+            raise ClosedError("WAL failed after an I/O error" if self._failed else "WAL is closed")
         return self._file
 
+    def _fail(self) -> None:
+        """Close the file after an I/O error and refuse further use."""
+        file, self._file = self._file, None
+        self._failed = True
+        if file is not None:
+            with contextlib.suppress(OSError):
+                file.close()
+
+    def _write_out(self, file: BinaryIO, record: bytes) -> None:
+        """Write ``record`` (if any), flush and optionally sync; fail closed on error."""
+        try:
+            if record:
+                file.write(record)
+            file.flush()
+            if self._sync:
+                os.fsync(file.fileno())
+        except OSError:
+            self._fail()
+            raise
+
     def _append(self, record: bytes) -> None:
-        file = self._live()
-        file.write(record)
-        file.flush()
-        if self._sync:
-            os.fsync(file.fileno())
+        self._write_out(self._live(), record)
 
     def append_put(self, key: bytes, value: bytes) -> None:
         """Append a put record.
 
         Raises:
-            ClosedError: the log is closed.
+            ClosedError: the log is closed or failed.
+            OSError: the write failed; the log is now failed.
             TypeError: ``key`` or ``value`` is not ``bytes``.
             ValueError: ``key`` or ``value`` violates the size limits.
         """
@@ -93,7 +123,8 @@ class WAL:
         """Append a delete record.
 
         Raises:
-            ClosedError: the log is closed.
+            ClosedError: the log is closed or failed.
+            OSError: the write failed; the log is now failed.
             TypeError: ``key`` is not ``bytes``.
             ValueError: ``key`` violates the size limits.
         """
@@ -102,17 +133,18 @@ class WAL:
 
     def flush(self) -> None:
         """Flush buffered data to the OS, and to disk if ``sync`` is enabled."""
-        file = self._live()
-        file.flush()
-        if self._sync:
-            os.fsync(file.fileno())
+        self._write_out(self._live(), b"")
 
     def reset(self) -> None:
         """Discard all records (used after the memtable has been flushed)."""
         file = self._live()
-        file.flush()
-        file.truncate(0)
-        os.fsync(file.fileno())
+        try:
+            file.flush()
+            file.truncate(0)
+            os.fsync(file.fileno())
+        except OSError:
+            self._fail()
+            raise
 
     def close(self) -> None:
         """Flush and close the log. Closing twice is a no-op."""
@@ -175,6 +207,8 @@ def scan_wal(path: str | os.PathLike[str]) -> WALScan:
     """Read the log at ``path`` up to its first bad record.
 
     Never raises for malformed content; a missing file yields an empty scan.
+    Any other :class:`OSError` (``PermissionError``, ``IsADirectoryError``,
+    ...) still propagates.
     Scanning stops at the first record that is short, fails its CRC, has an
     unknown op, inconsistent lengths, an empty or oversized key, or a length
     beyond the largest possible record.

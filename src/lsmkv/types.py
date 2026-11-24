@@ -38,7 +38,7 @@ def validate_key(key: object) -> bytes:
         TypeError: ``key`` is not ``bytes``.
         ValueError: ``key`` is empty or longer than ``MAX_KEY_SIZE``.
     """
-    if not isinstance(key, bytes):
+    if type(key) is not bytes:
         raise TypeError(f"key must be bytes, not {type(key).__name__}")
     if not key:
         raise ValueError("key must not be empty")
@@ -56,7 +56,7 @@ def validate_value(value: object) -> bytes:
         TypeError: ``value`` is not ``bytes``.
         ValueError: ``value`` is longer than ``MAX_VALUE_SIZE``.
     """
-    if not isinstance(value, bytes):
+    if type(value) is not bytes:
         raise TypeError(f"value must be bytes, not {type(value).__name__}")
     if len(value) > MAX_VALUE_SIZE:
         raise ValueError(f"value is {len(value)} bytes; the maximum is {MAX_VALUE_SIZE}")
