@@ -57,7 +57,7 @@ Writes are logged before they are applied, so the memtable can always be rebuilt
 | `compaction.py` | Pure planner that chooses which adjacent, similarly sized tables to merge. |
 | `manifest.py` | The atomically replaced list of live tables, table file naming, and directory fsync. |
 | `types.py` | The `MISSING` sentinel, the `Entry` type, size limits and input validation. |
-| `errors.py` | `LSMError`, `CorruptionError` and `ClosedError`. |
+| `errors.py` | `LSMError`, `CorruptionError`, `LockedError` and `ClosedError`. |
 | `cli.py`, `__main__.py` | The `lsmkv inspect` and `lsmkv verify` commands for table files. |
 
 ## Quick start
@@ -94,13 +94,13 @@ with DB.open("data") as db:
     db.compact()  # merges the tables on disk; does not flush the memtable
 ```
 
-The example creates a `data/` directory in the current working directory. Running it again reopens the same directory and recovers its state.
+The example creates a `data/` directory in the current working directory. Besides the table files, it holds `MANIFEST` (the list of live tables), `wal.log` (the write-ahead log) and `LOCK` (the open-instance lock). Running it again reopens the same directory and recovers its state.
 
 The public API is:
 
 | Method | Behavior |
 | --- | --- |
-| `DB.open(path, *, memtable_bytes, sync, block_size, compaction_trigger)` | Opens or creates a database directory and recovers it. Also a context manager. |
+| `DB.open(path, *, memtable_bytes, sync, block_size, compaction_trigger)` | Opens or creates a database directory and recovers it. Raises `LockedError` if the directory is already open. Also a context manager. |
 | `put(key, value)` | Logs the write, then applies it to the memtable. May trigger a flush. |
 | `get(key)` | Returns the value, or `None` if the key is absent or deleted. |
 | `delete(key)` | Records a tombstone. Deleting an absent key is allowed. |
@@ -175,7 +175,7 @@ The index holds one entry per data block: the block's last key, its offset and i
 {"version": 1, "next_id": 7, "tables": [6, 4, 3]}
 ```
 
-`tables` lists live table ids, newest first. `next_id` is the id the next table will receive. The file is replaced atomically: `MANIFEST.tmp` is written, fsynced, renamed over `MANIFEST`, and the directory is fsynced.
+`tables` lists live table ids, newest first. `next_id` is the id the next table will receive. The file is replaced atomically: `MANIFEST.tmp` is written, fsynced, renamed over `MANIFEST`, and the directory is fsynced. A manifest lists at most 10,000 tables; loading a longer list raises `CorruptionError`, and committing one raises `ValueError`.
 
 ## Crash safety
 
@@ -208,10 +208,11 @@ If the merged output contains no live entries (only tombstones, at the bottom of
 
 ### Recovery on open
 
-1. Read `MANIFEST`. A missing file means an empty database.
-2. Delete every `*.tmp` file (including a leftover `MANIFEST.tmp`, which is never read) and every `*.sst` file that the manifest does not list.
-3. Open each listed table. A missing listed table is reported as `CorruptionError`.
-4. Replay `wal.log` into a fresh memtable, stopping at the first short or corrupt record. Truncate any torn tail, then open the log for appending.
+1. Take an exclusive, non-blocking `flock` on `LOCK`. If another open instance holds it, in this process or another, open raises `LockedError`. On Windows no lock is taken.
+2. Load `MANIFEST`. For a brand-new directory, with no `MANIFEST` and no table files, commit an empty manifest. If `MANIFEST` is missing but engine-named table files (`NNNNNN.sst`) exist, open raises `CorruptionError` and deletes nothing.
+3. Delete only engine-named orphans: `NNNNNN.sst` files the manifest does not list, `NNNNNN.sst.tmp` files and `MANIFEST.tmp`. Any other file is never touched.
+4. Open each listed table. A missing listed table is reported as `CorruptionError`.
+5. Replay `wal.log` into a fresh memtable, stopping at the first short or corrupt record. Truncate any torn tail, then open the log for appending and fsync the directory so the log's directory entry is durable.
 
 ### Invariants
 
@@ -220,7 +221,7 @@ If the merged output contains no live entries (only tombstones, at the bottom of
 3. A tombstone shadows every older value of its key. Tombstones are dropped only when compacting into the oldest table.
 4. Recovery is idempotent: replaying a WAL whose contents are already in a listed table yields the same logical state.
 5. Every length read from disk is checked against the remaining file size and the configured limits before it is used for allocation.
-6. Files the manifest does not reference are orphans of an interrupted flush or compaction and are deleted on open.
+6. Engine-named files the manifest does not reference are orphans of an interrupted flush or compaction and are deleted on open. Other files in the directory are never touched.
 
 The crash points above are exercised by in-process tests that simulate a crash or an I/O failure at each step. Nothing in the test suite kills a process or simulates power loss, and there is no filesystem shim that stops at every system call.
 
@@ -228,7 +229,7 @@ The crash points above are exercised by in-process tests that simulate a crash o
 
 Test files live in `tests/`.
 
-- **Unit tests** cover each module: memtable, Bloom filter, merge, manifest, types, WAL, SSTable, DB, DB scans, compaction and the CLI. They include edge cases such as an empty table, a single key, keys at block boundaries, maximum-size keys and values, and empty values versus tombstones.
+- **Unit tests** cover each module: memtable, Bloom filter, merge, manifest, types, WAL, SSTable, DB, DB scans, DB locking, compaction and the CLI. They include edge cases such as an empty table, a single key, keys at block boundaries, maximum-size keys and values, and empty values versus tombstones.
 - **WAL recovery** (`test_wal_recovery.py`) truncates a log at every byte offset and flips every bit of it. Recovery must return a strict prefix of the appended operations. Hypothesis tests append arbitrary bytes after valid records and feed arbitrary file contents to recovery, which must never raise.
 - **SSTable fuzzing** (`test_sstable_fuzz.py`) truncates a valid table at every offset, flips every byte, appends garbage, and applies random Hypothesis mutations to valid tables. Arbitrary bytes are also fed directly to the reader. The reader must either return exactly the original data or raise `CorruptionError`.
 - **Stateful model test** (`test_db_stateful.py`) is a Hypothesis `RuleBasedStateMachine`. It applies put, delete, get, scan, flush, compact, reopen and crash-reopen operations to the engine and to a `dict`, and compares the answers.
@@ -265,12 +266,14 @@ Measured on one run, not a rigorous benchmark:
 
 | Workload | Ops | Seconds | Ops/s |
 | --- | ---: | ---: | ---: |
-| sequential puts | 100000 | 0.889 | 112,466 |
-| random puts | 100000 | 0.995 | 100,552 |
-| random reads (existing) | 100000 | 2.272 | 44,022 |
-| random reads (missing) | 100000 | 0.330 | 302,977 |
-| full scan | 100000 | 0.095 | 1,048,080 |
-| reopen (replay 1000 WAL records + open 1 tables) | – | 0.005 | – |
+| sequential puts | 100000 | 0.970 | 103,083 |
+| random puts | 100000 | 1.141 | 87,605 |
+| random reads (existing) | 100000 | 2.464 | 40,582 |
+| random reads (missing) | 100000 | 0.353 | 283,451 |
+| full scan | 100000 | 0.093 | 1,078,513 |
+| reopen (replay 1000 WAL records + open 1 tables) | – | 0.006 | – |
+
+Repeated runs on the same machine varied by roughly 10%.
 
 Missing-key reads run about 7 times faster than hits, because the Bloom filter rejects most absent keys before any data block is read, while a hit must read, checksum and decode a block. Full scans are fast because data blocks are read sequentially. This is a pure Python implementation, so the numbers illustrate the effect of the design on one machine rather than raw speed, and they are not comparable with other databases.
 
@@ -288,7 +291,7 @@ Missing-key reads run about 7 times faster than hits, because the Bloom filter r
 
 ## Limitations
 
-- **Single process.** A `threading.Lock` serializes access within one process. There is no file lock, so two processes must not open the same directory.
+- **Advisory lock only.** A `threading.Lock` serializes access within one process. On POSIX systems an exclusive `flock` on `LOCK` makes a second open of the same directory fail with `LockedError`, whether it comes from the same process or another one. The lock is advisory: it does not stop programs that touch the files without taking it. It is not taken on Windows, where each directory must be opened only once. Behavior on network file systems is not tested. Keep each database in a directory of its own.
 - **No background work.** Flushes and compactions run inline in the writer. There are no background threads.
 - **Durability levels.** With `sync=False`, an acknowledged write has reached the operating system but may not be on disk, so it survives a process crash but not a power failure. With `sync=True`, each write is fsynced before it is acknowledged. The power-loss behavior of that mode depends on the operating system honoring `fsync`, and it has not been tested on power-loss hardware.
 - **No block cache and no compression.** Every block read goes to the operating system, and table files are stored uncompressed.
