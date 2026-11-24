@@ -103,7 +103,7 @@ def test_flush_of_empty_memtable_is_a_noop(tmp_path: Path) -> None:
         db.flush()
         db.flush()
         assert list(db.table_ids) == [1]
-    assert names(tmp_path) == {"wal.log", "MANIFEST", "000001.sst"}
+    assert names(tmp_path) == {"wal.log", "MANIFEST", "LOCK", "000001.sst"}
 
 
 def test_small_memtable_forces_several_flushes(tmp_path: Path) -> None:
@@ -173,18 +173,122 @@ def test_orphan_files_are_removed_on_open(tmp_path: Path) -> None:
     (tmp_path / "000009.sst").write_bytes(b"")
     (tmp_path / "000003.sst.tmp").write_bytes(b"partial")
     (tmp_path / "MANIFEST.tmp").write_bytes(b"partial")
-    (tmp_path / "notes.txt").write_bytes(b"not ours")
+    (tmp_path / "1234567.sst").write_bytes(b"orphan with a wide id")
+    (tmp_path / "1234568.sst.tmp").write_bytes(b"partial with a wide id")
     with DB.open(tmp_path) as db:
         assert db.get(b"a") == b"1"
-    assert names(tmp_path) == {"wal.log", "MANIFEST", "000001.sst", "notes.txt"}
+    assert names(tmp_path) == {"wal.log", "MANIFEST", "LOCK", "000001.sst"}
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "notes.txt",
+        "notes.tmp",
+        "backup.sst",
+        "foo.sst",
+        "123.sst",
+        "000002.sst.bak",
+        "000002.sst.tmp.old",
+        "x000002.sst",
+        "000002.sst~",
+        "MANIFEST.bak",
+        "wal.log.tmp",
+        "LOCK.tmp",
+    ],
+)
+def test_foreign_files_are_never_removed(tmp_path: Path, name: str) -> None:
+    with DB.open(tmp_path) as db:
+        db.put(b"a", b"1")
+        db.flush()
+    (tmp_path / name).write_bytes(b"not ours")
+    with DB.open(tmp_path) as db:
+        assert db.get(b"a") == b"1"
+    assert (tmp_path / name).read_bytes() == b"not ours"
+
+
+def test_foreign_directories_are_left_alone(tmp_path: Path) -> None:
+    with DB.open(tmp_path):
+        pass
+    (tmp_path / "000002.sst").mkdir()
+    (tmp_path / "000003.sst.tmp").mkdir()
+    with DB.open(tmp_path):
+        pass
+    assert (tmp_path / "000002.sst").is_dir()
+    assert (tmp_path / "000003.sst.tmp").is_dir()
 
 
 def test_orphan_does_not_clash_with_next_flush(tmp_path: Path) -> None:
+    DB.open(tmp_path).close()
     (tmp_path / "000001.sst").write_bytes(b"garbage")
     with DB.open(tmp_path) as db:
         db.put(b"a", b"1")
         db.flush()
         assert db.get(b"a") == b"1"
+
+
+def test_fresh_directory_commits_an_empty_manifest(tmp_path: Path) -> None:
+    DB.open(tmp_path / "db").close()
+    assert (tmp_path / "db" / "MANIFEST").is_file()
+    assert Manifest.load(tmp_path / "db") == Manifest(1, ())
+
+
+def test_open_in_directory_with_only_foreign_files_works(tmp_path: Path) -> None:
+    (tmp_path / "backup.sst").write_bytes(b"not ours")
+    with DB.open(tmp_path) as db:
+        db.put(b"a", b"1")
+    assert (tmp_path / "backup.sst").read_bytes() == b"not ours"
+
+
+def test_lost_manifest_with_tables_is_corruption_and_files_survive(tmp_path: Path) -> None:
+    with DB.open(tmp_path) as db:
+        db.put(b"a", b"1")
+        db.flush()
+    (tmp_path / "MANIFEST").unlink()
+    before = (tmp_path / "000001.sst").read_bytes()
+    with pytest.raises(CorruptionError, match="manifest missing but table files exist"):
+        DB.open(tmp_path)
+    assert (tmp_path / "000001.sst").read_bytes() == before
+    assert not (tmp_path / "MANIFEST").exists()
+    # the failed open released the lock
+    (tmp_path / "MANIFEST").write_bytes(b'{"version": 1, "next_id": 2, "tables": [1]}')
+    with DB.open(tmp_path) as db:
+        assert db.get(b"a") == b"1"
+
+
+def test_lost_manifest_without_tables_is_recreated(tmp_path: Path) -> None:
+    with DB.open(tmp_path) as db:
+        db.put(b"a", b"1")
+    (tmp_path / "MANIFEST").unlink()
+    with DB.open(tmp_path) as db:
+        assert db.get(b"a") == b"1"
+    assert (tmp_path / "MANIFEST").is_file()
+
+
+def test_open_makes_the_log_directory_entry_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synced: list[set[str]] = []
+
+    def record(directory: object) -> None:
+        synced.append(names(tmp_path))
+
+    monkeypatch.setattr("lsmkv.db.fsync_dir", record)
+    DB.open(tmp_path).close()
+    assert any("wal.log" in seen for seen in synced)
+
+
+def test_failed_directory_sync_on_open_releases_everything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(directory: object) -> None:
+        raise OSError("io error")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("lsmkv.db.fsync_dir", boom)
+        with pytest.raises(OSError, match="io error"):
+            DB.open(tmp_path)
+    DB.open(tmp_path).close()
 
 
 def test_corrupt_manifest_is_reported(tmp_path: Path) -> None:
@@ -313,7 +417,7 @@ def test_crash_during_flush_at_manifest_commit(
         assert reopened.table_ids == ()
         for key, value in expected.items():
             assert reopened.get(key) == value
-    assert names(tmp_path) == {"wal.log"}
+    assert names(tmp_path) == {"wal.log", "MANIFEST", "LOCK"}
 
 
 def test_crash_after_manifest_commit_before_wal_reset(tmp_path: Path) -> None:
@@ -350,6 +454,28 @@ def test_failed_sstable_write_leaves_database_usable(
         assert db.get(b"a") == b"1"
         db.flush()
         assert db.table_ids == (1,)
+
+
+def test_failure_to_unlink_old_tables_after_compaction_is_harmless(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError("read-only")
+
+    with DB.open(tmp_path, compaction_trigger=10**6) as db:
+        for i in range(3):
+            db.put(*kv(i))
+            db.flush()
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", refuse)
+            db.compact()
+        assert db.table_ids == (4,)
+        assert {"000001.sst", "000002.sst", "000003.sst"} <= names(tmp_path)
+        assert db.get(kv(1)[0]) == kv(1)[1]
+    with DB.open(tmp_path) as db:
+        assert db.table_ids == (4,)
+        assert db.get(kv(2)[0]) == kv(2)[1]
+    assert names(tmp_path) == {"wal.log", "MANIFEST", "LOCK", "000004.sst"}
 
 
 def test_closed_database_raises(tmp_path: Path) -> None:

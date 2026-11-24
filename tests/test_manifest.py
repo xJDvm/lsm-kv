@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -11,7 +13,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from lsmkv.errors import CorruptionError
-from lsmkv.manifest import Manifest, table_path
+from lsmkv.manifest import Manifest, fsync_dir, table_path
 
 
 def write_raw(directory: Path, content: bytes | str) -> None:
@@ -160,6 +162,71 @@ def test_commit_rejects_invalid_manifest(tmp_path: Path, manifest: Manifest) -> 
     with pytest.raises(ValueError):
         Manifest.commit(tmp_path, manifest)
     assert not (tmp_path / "MANIFEST").exists()
+
+
+def test_table_count_cap(tmp_path: Path) -> None:
+    at_cap = list(range(10_000, 0, -1))
+    write_raw(tmp_path, doc(next_id=10_001, tables=at_cap))
+    assert Manifest.load(tmp_path).tables == tuple(at_cap)
+    write_raw(tmp_path, doc(next_id=10_002, tables=[10_001, *at_cap]))
+    with pytest.raises(CorruptionError, match="too many tables"):
+        Manifest.load(tmp_path)
+
+
+def test_commit_rejects_too_many_tables(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="too many tables"):
+        Manifest.commit(tmp_path, Manifest(10_002, tuple(range(10_001, 0, -1))))
+    assert not (tmp_path / "MANIFEST").exists()
+
+
+def test_fsync_dir_propagates_real_io_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failing_fsync(fd: int) -> None:
+        raise OSError(errno.EIO, "input/output error")
+
+    monkeypatch.setattr(os, "fsync", failing_fsync)
+    with pytest.raises(OSError) as info:
+        fsync_dir(tmp_path)
+    assert info.value.errno == errno.EIO
+
+
+@pytest.mark.parametrize(
+    "code", [errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EBADF], ids=str
+)
+def test_fsync_dir_swallows_unsupported(
+    code: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unsupported(fd: int) -> None:
+        raise OSError(code, "unsupported")
+
+    monkeypatch.setattr(os, "fsync", unsupported)
+    fsync_dir(tmp_path)
+
+
+def test_fsync_dir_open_failure_propagates_off_windows(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        fsync_dir(tmp_path / "missing")
+
+
+def test_fsync_dir_tolerates_windows_style_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(*args: object, **kwargs: object) -> int:
+        raise PermissionError(errno.EACCES, "access denied")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(os, "open", refuse)
+        fsync_dir(tmp_path)
+
+    def eio(fd: int) -> None:
+        raise OSError(errno.EIO, "input/output error")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(os, "fsync", eio)
+        fsync_dir(tmp_path)
 
 
 def test_table_path_is_derived_from_the_integer_id(tmp_path: Path) -> None:

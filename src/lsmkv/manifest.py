@@ -13,6 +13,7 @@ the manifest does not mention is an orphan of an interrupted operation.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from dataclasses import dataclass
@@ -21,12 +22,15 @@ from typing import Final
 
 from lsmkv.errors import CorruptionError
 
-__all__ = ["MANIFEST_NAME", "Manifest", "fsync_dir", "table_path"]
+__all__ = ["MANIFEST_NAME", "MANIFEST_TMP_NAME", "Manifest", "fsync_dir", "table_path"]
 
 MANIFEST_NAME: Final = "MANIFEST"
-_TMP_NAME: Final = "MANIFEST.tmp"
+MANIFEST_TMP_NAME: Final = "MANIFEST.tmp"
 _VERSION: Final = 1
 _MAX_MANIFEST_SIZE: Final = 1024 * 1024
+_MAX_TABLES: Final = 10_000
+#: errno values meaning "this filesystem cannot fsync a directory".
+_FSYNC_UNSUPPORTED: Final = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EBADF})
 
 
 def table_path(directory: str | os.PathLike[str], table_id: int) -> Path:
@@ -40,13 +44,22 @@ def table_path(directory: str | os.PathLike[str], table_id: int) -> Path:
 
 def fsync_dir(directory: str | os.PathLike[str]) -> None:
     """Flush a directory's entries (creations, renames) to stable storage."""
-    fd = os.open(directory, os.O_RDONLY)
+    on_windows = os.name == "nt"
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        # Windows cannot open a directory this way; elsewhere it is a real error.
+        if on_windows:
+            return
+        raise
     try:
         os.fsync(fd)
-    except OSError:
-        # Some platforms and filesystems refuse fsync on a directory handle
-        # (for example Windows); the rename is then as durable as it can be.
-        pass
+    except OSError as exc:
+        # Some platforms and filesystems refuse fsync on a directory handle;
+        # the rename is then as durable as it can be. Real I/O errors (EIO,
+        # ENOSPC, ...) must not be hidden.
+        if not on_windows and exc.errno not in _FSYNC_UNSUPPORTED:
+            raise
     finally:
         os.close(fd)
 
@@ -58,6 +71,8 @@ def _problem(next_id: object, tables: object) -> str | None:
         return "next_id must be an integer"
     if not isinstance(tables, (list, tuple)):
         return "tables must be a list"
+    if len(tables) > _MAX_TABLES:
+        return "too many tables"
     for table_id in tables:
         if type(table_id) is not int:
             return "table ids must be integers"
@@ -129,7 +144,7 @@ class Manifest:
             raise ValueError(f"invalid manifest: {problem}")
         doc = {"version": _VERSION, "next_id": manifest.next_id, "tables": list(manifest.tables)}
         base = Path(directory)
-        tmp = base / _TMP_NAME
+        tmp = base / MANIFEST_TMP_NAME
         with open(tmp, "wb") as f:
             f.write(json.dumps(doc).encode("ascii"))
             f.flush()

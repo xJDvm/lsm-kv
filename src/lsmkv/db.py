@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
+import sys
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -18,17 +20,24 @@ from types import TracebackType
 from typing import Final
 
 from lsmkv.compaction import pick_tiered_run
-from lsmkv.errors import ClosedError, CorruptionError
-from lsmkv.manifest import Manifest, fsync_dir, table_path
+from lsmkv.errors import ClosedError, CorruptionError, LockedError
+from lsmkv.manifest import MANIFEST_NAME, MANIFEST_TMP_NAME, Manifest, fsync_dir, table_path
 from lsmkv.memtable import Memtable
 from lsmkv.merge import drop_tombstones, merge_iterators
 from lsmkv.sstable import SSTableReader, write_sstable
 from lsmkv.types import MISSING, validate_key, validate_value
 from lsmkv.wal import WAL, recover_wal
 
+if sys.platform != "win32":
+    import fcntl
+
 __all__ = ["DB"]
 
 _WAL_NAME: Final = "wal.log"
+_LOCK_NAME: Final = "LOCK"
+# Table names are zero-padded to six digits but grow past that (see table_path).
+_TABLE_RE: Final = re.compile(r"\d{6,}\.sst")
+_TABLE_TMP_RE: Final = re.compile(r"\d{6,}\.sst\.tmp")
 
 
 class DB:
@@ -38,8 +47,12 @@ class DB:
     is distinct from a deleted key). Create instances with :meth:`open`.
 
     Thread safety: a single lock serializes every public method, so one
-    instance may be shared between threads of one process. Separate processes
-    must not open the same directory; there is no file lock.
+    instance may be shared between threads of one process. Opening takes an
+    exclusive, non-blocking ``flock`` on the ``LOCK`` file in the directory, so
+    a second open of the same directory, from this or another process, raises
+    :class:`~lsmkv.errors.LockedError` until the first instance is closed. The
+    lock is advisory and is skipped on platforms without ``fcntl`` (Windows),
+    where callers must ensure a directory is opened only once.
 
     Durability: with ``sync=False`` (the default) an acknowledged write has
     reached the operating system but not necessarily the disk, so it survives a
@@ -63,8 +76,10 @@ class DB:
         readers: list[SSTableReader],
         memtable: Memtable,
         wal: WAL,
+        lock_fd: int | None,
     ) -> None:
         self._path = path
+        self._lock_fd = lock_fd
         self._memtable_bytes = memtable_bytes
         self._block_size = block_size
         self._compaction_trigger = compaction_trigger
@@ -87,9 +102,10 @@ class DB:
     ) -> DB:
         """Open the database in directory ``path``, creating it if needed.
 
-        Opening recovers from any earlier crash: files the manifest does not
-        reference (interrupted flushes) are deleted and the write-ahead log is
-        replayed into a fresh memtable, discarding a torn tail.
+        Opening recovers from any earlier crash: table and temporary files the
+        manifest does not reference (interrupted flushes) are deleted and the
+        write-ahead log is replayed into a fresh memtable, discarding a torn
+        tail. Files that do not follow the engine's naming are never touched.
 
         Args:
             path: Database directory.
@@ -102,7 +118,8 @@ class DB:
         Raises:
             ValueError: an option is out of range.
             CorruptionError: the manifest or a table it lists is damaged or
-                missing.
+                missing, or the manifest is missing while table files exist.
+            LockedError: the directory is already open.
             OSError: the directory cannot be created or read.
         """
         if memtable_bytes < 1:
@@ -114,11 +131,12 @@ class DB:
         directory = Path(path)
         directory.mkdir(parents=True, exist_ok=True)
 
-        manifest = Manifest.load(directory)
-        _remove_orphans(directory, manifest)
+        lock_fd = _lock_directory(directory)
         readers: list[SSTableReader] = []
         wal: WAL | None = None
         try:
+            manifest = _load_or_create_manifest(directory)
+            _remove_orphans(directory, manifest)
             for table_id in manifest.tables:
                 readers.append(_open_table(directory, table_id))
             memtable = Memtable()
@@ -128,6 +146,7 @@ class DB:
                 else:
                     memtable.put(key, value)
             wal = WAL.open(directory / _WAL_NAME, sync=sync)
+            fsync_dir(directory)  # make the log's directory entry durable
             return cls(
                 directory,
                 memtable_bytes=memtable_bytes,
@@ -137,12 +156,14 @@ class DB:
                 readers=readers,
                 memtable=memtable,
                 wal=wal,
+                lock_fd=lock_fd,
             )
         except BaseException:
             for reader in readers:
                 reader.close()
             if wal is not None:
                 wal.close()
+            _unlock(lock_fd)
             raise
 
     @property
@@ -431,10 +452,13 @@ class DB:
         except BaseException:
             self._shutdown()
             raise
+        # The new manifest is committed, so failing to clean up is harmless:
+        # leftover files are orphans that the next open removes.
         for reader in old_readers:
-            reader.close()
+            with contextlib.suppress(OSError):
+                reader.close()
         for old_id in old_ids:
-            with contextlib.suppress(FileNotFoundError):
+            with contextlib.suppress(OSError):
                 table_path(self._path, old_id).unlink()
 
     def _shutdown(self) -> None:
@@ -442,13 +466,64 @@ class DB:
             return
         self._closed = True
         wal, self._wal = self._wal, None
+        lock_fd, self._lock_fd = self._lock_fd, None
         try:
             if wal is not None:
                 wal.close()
         finally:
-            for reader in self._readers:
-                reader.close()
-            self._readers = []
+            try:
+                for reader in self._readers:
+                    reader.close()
+                self._readers = []
+            finally:
+                _unlock(lock_fd)
+
+
+def _lock_directory(directory: Path) -> int | None:
+    """Take the exclusive process lock on ``directory`` and return its fd.
+
+    The lock is an ``flock`` on the ``LOCK`` file. It belongs to the open file
+    description, so it also excludes a second open in the same process, and the
+    operating system drops it if the process dies. Returns ``None`` on
+    platforms without ``fcntl``, where no lock is taken.
+
+    Raises:
+        LockedError: another instance holds the lock.
+    """
+    if sys.platform == "win32":
+        return None
+    fd = os.open(directory / _LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise LockedError("database is locked by another process") from None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _unlock(fd: int | None) -> None:
+    """Release a lock taken by :func:`_lock_directory` by closing its fd."""
+    if fd is not None:
+        os.close(fd)
+
+
+def _load_or_create_manifest(directory: Path) -> Manifest:
+    """Load the manifest, committing an empty one for a brand-new database.
+
+    Every database that has ever been opened therefore has a MANIFEST. If it
+    is missing while engine-named table files exist, the manifest was lost and
+    guessing which tables are live could discard data, so open refuses.
+    """
+    if (directory / MANIFEST_NAME).exists():
+        return Manifest.load(directory)
+    if any(_TABLE_RE.fullmatch(entry.name) for entry in directory.iterdir()):
+        raise CorruptionError("manifest missing but table files exist")
+    manifest = Manifest(1, ())
+    Manifest.commit(directory, manifest)
+    return manifest
 
 
 def _open_table(directory: Path, table_id: int) -> SSTableReader:
@@ -462,12 +537,19 @@ def _open_table(directory: Path, table_id: int) -> SSTableReader:
 def _remove_orphans(directory: Path, manifest: Manifest) -> None:
     """Delete leftovers of interrupted flushes (invariant 6).
 
-    Orphans are ``*.sst`` files the manifest does not list and any ``*.tmp``
-    file. Only regular files directly inside ``directory`` are touched.
+    Orphans are engine-named table files (``000042.sst``) the manifest does not
+    list, engine-named temporaries (``000042.sst.tmp``) and ``MANIFEST.tmp``.
+    Any other name, including ``LOCK`` and foreign ``.sst`` or ``.tmp`` files,
+    is left alone. Only regular files directly inside ``directory`` are touched.
     """
     live = {table_path(directory, table_id).name for table_id in manifest.tables}
     for entry in directory.iterdir():
-        orphan = entry.suffix == ".tmp" or (entry.suffix == ".sst" and entry.name not in live)
+        name = entry.name
+        orphan = (
+            name == MANIFEST_TMP_NAME
+            or _TABLE_TMP_RE.fullmatch(name) is not None
+            or (_TABLE_RE.fullmatch(name) is not None and name not in live)
+        )
         if orphan and entry.is_file():
             with contextlib.suppress(FileNotFoundError):
                 entry.unlink()
