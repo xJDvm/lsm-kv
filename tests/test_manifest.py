@@ -191,9 +191,17 @@ def test_fsync_dir_propagates_real_io_errors(
     assert info.value.errno == errno.EIO
 
 
-@pytest.mark.parametrize(
-    "code", [errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EBADF], ids=str
-)
+def test_fsync_dir_does_not_hide_ebadf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def bad_fd(fd: int) -> None:
+        raise OSError(errno.EBADF, "bad file descriptor")
+
+    monkeypatch.setattr(os, "fsync", bad_fd)
+    with pytest.raises(OSError) as info:
+        fsync_dir(tmp_path)
+    assert info.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP], ids=str)
 def test_fsync_dir_swallows_unsupported(
     code: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

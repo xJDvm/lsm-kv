@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,44 @@ def test_failed_open_does_not_keep_the_lock(tmp_path: Path) -> None:
     (tmp_path / "MANIFEST").unlink()
     with DB.open(tmp_path):
         pass
+
+
+def _fail(message: str) -> Callable[..., None]:
+    def raiser(*args: object, **kwargs: object) -> None:
+        raise OSError(message)
+
+    return raiser
+
+
+def test_failed_open_releases_lock_when_reader_close_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with DB.open(tmp_path) as db:
+        db.put(b"k", b"v")
+        db.flush()
+    with monkeypatch.context() as patch:
+        patch.setattr("lsmkv.db.WAL.open", staticmethod(_fail("wal open failed")))
+        patch.setattr("lsmkv.db.SSTableReader.close", _fail("reader close failed"))
+        with pytest.raises(OSError, match="reader close failed"):
+            DB.open(tmp_path)
+    with DB.open(tmp_path) as reopened:
+        assert reopened.get(b"k") == b"v"
+
+
+def test_failed_open_releases_lock_when_wal_close_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with DB.open(tmp_path) as db:
+        db.put(b"k", b"v")
+        db.flush()
+    with monkeypatch.context() as patch:
+        patch.setattr("lsmkv.db.fsync_dir", _fail("fsync failed"))
+        patch.setattr("lsmkv.db.WAL.close", _fail("wal close failed"))
+        patch.setattr("lsmkv.db.SSTableReader.close", _fail("reader close failed"))
+        with pytest.raises(OSError, match="reader close failed"):
+            DB.open(tmp_path)
+    with DB.open(tmp_path) as reopened:
+        assert reopened.get(b"k") == b"v"
 
 
 def test_lock_file_survives_orphan_cleanup(tmp_path: Path) -> None:

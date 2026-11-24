@@ -159,11 +159,16 @@ class DB:
                 lock_fd=lock_fd,
             )
         except BaseException:
-            for reader in readers:
-                reader.close()
-            if wal is not None:
-                wal.close()
-            _unlock(lock_fd)
+            # Whatever a close raises, the lock must still be released.
+            try:
+                if wal is not None:
+                    wal.close()
+            finally:
+                try:
+                    for reader in readers:
+                        reader.close()
+                finally:
+                    _unlock(lock_fd)
             raise
 
     @property

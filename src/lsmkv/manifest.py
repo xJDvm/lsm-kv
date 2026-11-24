@@ -30,7 +30,7 @@ _VERSION: Final = 1
 _MAX_MANIFEST_SIZE: Final = 1024 * 1024
 _MAX_TABLES: Final = 10_000
 #: errno values meaning "this filesystem cannot fsync a directory".
-_FSYNC_UNSUPPORTED: Final = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EBADF})
+_FSYNC_UNSUPPORTED: Final = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP})
 
 
 def table_path(directory: str | os.PathLike[str], table_id: int) -> Path:
@@ -102,7 +102,9 @@ class Manifest:
         """Read the manifest in ``directory``.
 
         A missing file means a fresh database and yields ``Manifest(1, ())``.
-        A leftover ``MANIFEST.tmp`` from an interrupted commit is ignored.
+        ``DB.open`` commits an empty manifest for new databases, so a missing
+        file only occurs for directories that were never opened. A leftover
+        ``MANIFEST.tmp`` from an interrupted commit is ignored.
 
         Raises:
             CorruptionError: the file is larger than 1 MiB, is not valid JSON,
